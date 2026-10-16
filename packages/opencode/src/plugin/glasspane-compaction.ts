@@ -1,0 +1,364 @@
+import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+
+import { describeDimensionCoverage, dimensionCoverage, readEvidenceFrame, readRunPlan } from "../tool/glasspane/kernel"
+import type { KernelRejection, RunPlanRef } from "../tool/glasspane/kernel"
+
+/** What `readRunPlan` answered for this session: a plan, no plan, or a refusal. */
+export type PlanRead = { ok: true; plan: RunPlanRef | null } | { ok: false; error: KernelRejection }
+
+/**
+ * M4 — the fork's compaction plugin: when a session that used the GlassPane tool
+ * surface is compacted, the evidence anchors that surface produced are injected
+ * back into the compaction prompt, so summarising cannot silently drop the
+ * session's on-ramp into the decision-log audit chain.
+ *
+ * WHY THIS EXISTS. A `gp_*` session's meaning lives in four fields that prose
+ * loses first: the operationId, the engine's outcome, and the ledger sequence +
+ * entry hash (M2 writes those into `metadata.decisionLog`). Upstream compaction
+ * summarises the conversation like any other; a summariser that keeps the story
+ * but drops the hashes leaves a session whose claims can no longer be tied to
+ * the chain. This hook is the fork-side half of 综述 §8.5's "上下文压缩钩子无法
+ * 感知审查维度上下文" loss: the compression step must at least *know* what the
+ * session verified.
+ *
+ * WHAT THIS MODULE MAY NOT DO.
+ *  - It may not re-judge. Every anchor field is transcribed from something the
+ *    engine wrote (`metadata.result`) or the kernel wrote (`decisionLog` note,
+ *    chained through `kernel.ts`). No thresholds, no pass/fail synthesis, no
+ *    "looks verified" — the iron law, same as M1/M2.
+ *  - It may not invent dimensions. The kernel's dimension system
+ *    (`dimensionContext`, 综述 §8.5 / PRD §8.5) landed in the kernel at
+ *    `2ed342b` and is consumed here through `dimensionCoverage`. It takes the
+ *    dimension ids the caller was configured with and does the accounting; the
+ *    vocabulary itself belongs to the iterate config (nine ids, locked across
+ *    six sources by `test_dimension_lock.py`), so this module never declares an
+ *    ontology of its own. As shipped, the production path reaches this with no plan
+ *    (`GLASSPANE_RUN_PLAN` is unset by default), and the anchors it can carry a
+ *    declared dimension on come only from calls that recorded a decision: the engine
+ *    emits an `evidencePack` on one method, `last_evidence` (`Dispatcher.swift:156`),
+ *    so a dimension declared on `gp_act`, `gp_observe`, `gp_attach` or `gp_diagnose`
+ *    never reaches an anchor at all — those calls record no decision, and an anchor is
+ *    where a declared dimension would have been transcribed. With nothing planned and
+ *    nothing recorded `renderDimensionCoverage` returns `undefined` and the block
+ *    simply omits the line. A session with a plan and zero
+ *    decisions would get "0/N dimensions verified", which is the useful sentence; a session
+ *    with no plan gets silence, because there is no coverage to state. Wiring the plan
+ *    (the kernel's `run-plan` contract carries `dimensions`) is open work, and
+ *    test/plugin/glasspane-compaction.test.ts pins the as-shipped shape so this paragraph
+ *    cannot quietly drift back into a claim.
+ *  - It may not break compaction. A failed message pull appends a visible note
+ *    and returns; it never throws into the host's compaction path, and it never
+ *    replaces `output.prompt` (replacing it would silently discard the default
+ *    summarisation instruction — appending is the only edit upstream's shape
+ *    makes safe: `compacting.prompt ?? [...context]`).
+ *
+ * Upstream shape being coded against (`v1.18.32`, `session/compaction.ts:374`):
+ * `trigger("experimental.session.compacting", { sessionID }, { context: [], prompt: undefined })`.
+ * The hook receives only the session id, so the messages must be pulled — this
+ * module therefore takes a `pull` function, and the host client lives in the
+ * binding below, not in the logic.
+ */
+
+const GLASSPANE_TOOL_PREFIX = "gp_"
+/** Anchors are a pointer into the chain, not a copy of it; the ledger keeps the rest. */
+const MAX_ANCHORS = 20
+
+/** One transcribed decision. Undefined fields were absent — never filled in by guessing. */
+export type EvidenceAnchor = {
+  method: string
+  /**
+   * The review dimension this call was attributed to, when the host recorded
+   * one. Absent means the transcript did not say — it is never derived from the
+   * method name, because "observe" is a method, not a dimension.
+   */
+  dimension?: string
+  operationId?: string
+  outcome?: string
+  ledgerLine?: number
+  ledgerHash?: string
+  ledgerPath?: string
+}
+
+export type AnchorCollection = {
+  /** gp_* calls that are settled history (completed or failed); a running part is not yet history. */
+  calls: number
+  /** Recorded decisions, in conversation order. */
+  anchors: EvidenceAnchor[]
+  withoutDecision: number
+  /**
+   * The dimension ids this session was reviewed against, as configured. Empty
+   * is a legitimate value and means the session was never given a plan — the
+   * kernel then reports zero coverage rather than this module inventing a
+   * vocabulary. Kept as a plain list because the ids come from the host's
+   * configuration, not from anything recorded in the transcript.
+   */
+  plannedDimensions?: string[]
+}
+
+export type CompactionNote =
+  | { status: "injected"; calls: number; anchors: number; target: "context" | "prompt"; block: string }
+  | { status: "skipped"; reason: string }
+  | { status: "failed"; code: string; message: string; remedy: string }
+
+export type PullSessionMessages = (sessionID: string) => Promise<unknown>
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function numberOf(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message
+  return text(error) ?? "unknown error"
+}
+
+
+/**
+ * Walk a `client.session.messages` reply and transcribe the decisions it holds.
+ * Pure: no client, no filesystem, no clock. Exported because the fixed-point
+ * tests drive it with message fixtures rather than a live host.
+ */
+export function collectEvidenceAnchors(messages: unknown): AnchorCollection {
+  const list = Array.isArray(messages) ? messages : []
+  const anchors: EvidenceAnchor[] = []
+  let calls = 0
+
+  for (const item of list) {
+    const parts = isRecord(item) && Array.isArray(item.parts) ? item.parts : []
+    for (const part of parts) {
+      if (!isRecord(part) || part.type !== "tool") continue
+      const tool = text(part.tool)
+      if (!tool?.startsWith(GLASSPANE_TOOL_PREFIX)) continue
+      const state = isRecord(part.state) ? part.state : undefined
+      const status = state ? text(state.status) : undefined
+      // A pending/running part is a call that has not settled: at compaction time
+      // it is not history yet and has no outcome to preserve.
+      if (status !== "completed" && status !== "error") continue
+      calls += 1
+      if (status !== "completed" || !state) continue
+
+      const metadata = isRecord(state.metadata) ? state.metadata : {}
+      const method = text(metadata.method) ?? tool.slice(GLASSPANE_TOOL_PREFIX.length)
+      const note = isRecord(metadata.decisionLog) ? metadata.decisionLog : undefined
+      // The dimension the caller declared on this call, echoed back by the shell in
+      // the result metadata. It is the caller's claim about which review dimension the
+      // call served, not an engine measurement — which is exactly why an absent one
+      // stays absent rather than being guessed from the method name.
+      const dimension = text(metadata.dimension)
+      // The note is M2's ledger receipt. No receipt = the chain holds no entry for
+      // this call (status-only method, or a call the engine refused) — that is
+      // counted, not papered over with a guessed outcome.
+      if (!note || note.status !== "logged") continue
+
+      // operationId is the only field read from the pack itself; optional because
+      // the receipt can outlive a body the kernel's read-side parser rejects.
+      const read = readEvidenceFrame(metadata.result)
+      anchors.push({
+        method,
+        dimension,
+        operationId: read.ok ? read.pack.operationId : undefined,
+        outcome: text(note.outcome),
+        ledgerLine: numberOf(note.line),
+        ledgerHash: text(note.hash),
+        ledgerPath: text(note.path),
+      })
+    }
+  }
+
+  return { calls, anchors, withoutDecision: calls - anchors.length }
+}
+
+/**
+ * The dimension coverage line, computed by the kernel and rendered verbatim.
+ *
+ * `undefined` only when the session was never given a plan AND recorded
+ * nothing — there is no coverage to state and inventing one would be the exact
+ * failure this whole structure exists to prevent. Every other case produces a
+ * line, including `0/3 dimensions verified, 3 unverified (…), 0 decisions`,
+ * which is the most useful sentence in the block.
+ *
+ * The plan comes from `GLASSPANE_RUN_PLAN` when it is set, because that is the
+ * channel the two shells share: whoever configured the run writes the plan file and
+ * digests it, and this side reads the same bytes rather than growing its own idea of
+ * what was planned. With no plan declared it falls back to whatever the host attached
+ * to the collection (unchanged behaviour for a host that configures dimensions in
+ * process). A plan that was declared but cannot be honoured is reported, not ignored:
+ * "no plan" and "your plan is unreadable" have to be distinguishable in the summary,
+ * or a broken channel reads as an unreviewed session.
+ */
+export function renderDimensionCoverage(
+  collected: AnchorCollection,
+  plan: PlanRead = { ok: true, plan: null },
+): string | undefined {
+  const planned = plan.ok && plan.plan ? [...plan.plan.ids] : (collected.plannedDimensions ?? [])
+  const recorded: Record<string, { decisions: number }> = {}
+  for (const anchor of collected.anchors) {
+    // Only an explicitly recorded dimension counts. Falling back to the method
+    // name would make "observe" a dimension, which is the guessing this module
+    // is not allowed to do; an anchor with no dimension simply contributes to no
+    // dimension, and the coverage line says so.
+    if (!anchor.dimension) continue
+    const current = recorded[anchor.dimension]
+    recorded[anchor.dimension] = { decisions: (current?.decisions ?? 0) + 1 }
+  }
+  if (!plan.ok) {
+    // The code travels with the sentence: a summary that only carries prose cannot be
+    // grouped, counted, or matched against the refusal a later run hit.
+    return `dimension coverage NOT computed — ${plan.error.code}: ${plan.error.message} (remedy: ${plan.error.remedy})`
+  }
+  if (planned.length === 0 && Object.keys(recorded).length === 0) return undefined
+
+  const context = dimensionCoverage({
+    planned: planned.map((id) => ({ id })),
+    recorded,
+  })
+  const line = describeDimensionCoverage(context)
+  return plan.ok && plan.plan ? `${line} [plan ${plan.plan.digest} @ ${plan.plan.path}]` : line
+}
+
+/**
+ * Render the injected block, or `undefined` when the session never touched the
+ * GlassPane surface (nothing to preserve, nothing to say). A session that *did*
+ * touch it always gets a block — including "decisions recorded: 0", because an
+ * absent record must be readable as absent, not left to be assumed absent.
+ */
+export function renderAnchorBlock(collected: AnchorCollection, plan: PlanRead = { ok: true, plan: null }): string | undefined {
+  if (collected.calls === 0) return undefined
+
+  const shown = collected.anchors.slice(-MAX_ANCHORS)
+  const omitted = collected.anchors.length - shown.length
+  const lines = [
+    "## GlassPane evidence anchors (M4)",
+    "",
+    "This session used the GlassPane tool surface. The lines below are transcribed verbatim",
+    "from records the engine wrote and the kernel chained; this harness does not re-judge",
+    "them, and nothing here is a verdict on the interface. Keep the anchors when",
+    "summarising — they are the session's on-ramp into the decision-log audit chain.",
+    "",
+    `gp_* calls: ${collected.calls} · decisions recorded: ${collected.anchors.length} · without a decision record: ${collected.withoutDecision}`,
+  ]
+  const coverage = renderDimensionCoverage(collected, plan)
+  if (coverage !== undefined) {
+    lines.push(
+      `- dimension coverage: ${coverage}`,
+      "  (computed by the kernel from the configured plan and what the engine recorded; a dimension",
+      "   with no decision is reported as unverified, never as fine)",
+    )
+  }
+  if (collected.withoutDecision > 0) {
+    lines.push(
+      "- calls without a decision record are status-only or failed calls (not every engine method emits an evidence pack) — counted, not guessed",
+    )
+  }
+  if (omitted > 0) {
+    lines.push(`- showing the most recent ${shown.length} anchors; ${omitted} older anchor(s) omitted — the ledger below has the full chain`)
+  }
+  for (const anchor of shown) {
+    const bits = [
+      anchor.method,
+      anchor.operationId ? `op ${anchor.operationId}` : undefined,
+      anchor.outcome ? `outcome ${anchor.outcome}` : undefined,
+      anchor.ledgerLine !== undefined ? `ledger #${anchor.ledgerLine}` : undefined,
+      anchor.ledgerHash ? `entry sha256 ${anchor.ledgerHash.slice(0, 16)}…` : undefined,
+    ].filter((bit): bit is string => bit !== undefined)
+    lines.push(`- ${bits.join(" · ")}`)
+  }
+  if (collected.anchors.length === 0) {
+    lines.push("- no decision-log entries were recorded in this session")
+  }
+  const ledgerPath = [...collected.anchors].reverse().find((anchor) => anchor.ledgerPath !== undefined)?.ledgerPath
+  if (ledgerPath) lines.push("", `ledger: ${ledgerPath}`)
+  return lines.join("\n")
+}
+
+/**
+ * Where an appended block goes. Upstream computes
+ * `nextPrompt = compacting.prompt ?? [defaultPrompt, ...compacting.context]`, so a
+ * `prompt` someone else already set makes `context` dead letter. Append to the
+ * prompt in that case (never replace it), and to context otherwise.
+ *
+ * Known boundary, stated rather than papered over: if another plugin sets
+ * `prompt` *after* this hook runs, the context array it just wrote is dropped by
+ * upstream's `??`. Nothing in this fork sets `prompt` (measured: no other plugin
+ * or feature touches this hook), so today the context lane is the one that runs;
+ * a future plugin that replaces the prompt must append its blocks itself.
+ */
+function appendBlock(output: { context: string[]; prompt?: string }, block: string): "context" | "prompt" {
+  if (output.prompt !== undefined) {
+    output.prompt = `${output.prompt}\n\n${block}`
+    return "prompt"
+  }
+  output.context.push(block)
+  return "context"
+}
+
+/**
+ * The hook body, exported separately so the fixed-point tests can drive it with
+ * a fake `pull`. Returns the note it produced; the host hook ignores the return.
+ */
+export async function injectEvidenceAnchors(
+  sessionID: string,
+  output: { context: string[]; prompt?: string },
+  pull: PullSessionMessages,
+  readPlan: () => ReturnType<typeof readRunPlan> = () => readRunPlan(),
+): Promise<CompactionNote> {
+  // Two stages, two truths. One `try` around pull + collect + render used to report every
+  // internal defect as "could not read this session's messages" — a kernel `throw` or a bad
+  // `readPlan()` came out as a host rejection, which sent the reader to the client/server
+  // pair for a bug in this file. Compaction is still never failed by this plugin (a note is
+  // written and the run continues); what changed is that the note now says which stage broke.
+  let messages: Awaited<ReturnType<PullSessionMessages>>
+  try {
+    messages = await pull(sessionID)
+  } catch (error) {
+    const message = `could not read this session's messages (${errorText(error)})`
+    const remedy = "re-run the same compaction once after gp_probe_status answers; if the note persists, the pull is broken and the ledger path in this session's decision entries is still readable"
+    appendBlock(output, `GlassPane compaction note: evidence anchors NOT preserved — ${message}. remedy: ${remedy}`)
+    return { status: "failed", code: "GP_E_COMPACTION_MESSAGES", message, remedy }
+  }
+  try {
+    const collected = collectEvidenceAnchors(messages)
+    const block = renderAnchorBlock(collected, readPlan())
+    if (!block) return { status: "skipped", reason: "no gp_* tool calls in this session" }
+    const target = appendBlock(output, block)
+    return { status: "injected", calls: collected.calls, anchors: collected.anchors.length, target, block }
+  } catch (error) {
+    const message = `the anchors were read but this plugin could not build the block (${errorText(error)})`
+    const remedy = `compact anyway — the chain is on disk and untouched by this; the failure is in this plugin's renderer, not in the host, so re-reading the session will not change it`
+    appendBlock(output, `GlassPane compaction note: evidence anchors NOT preserved — ${message}. remedy: ${remedy}`)
+    // Its own code, for its own stage: sharing `GP_E_COMPACTION_MESSAGES` with the pull
+    // failure made the two stages one bucket no matter what the sentence said, and the
+    // sentence right here blames this plugin's renderer.
+    return { status: "failed", code: "GP_E_COMPACTION_RENDER", message, remedy }
+  }
+}
+
+export async function GlasspaneCompactionPlugin(input: PluginInput): Promise<Hooks> {
+  return {
+    "experimental.session.compacting": async (hookInput, output) => {
+      await injectEvidenceAnchors(hookInput.sessionID, output, async (sessionID) => {
+        const result = await input.client.session.messages({ path: { id: sessionID } })
+        if (result.error !== undefined) throw new Error(describeSdkError(result.error))
+        return result.data
+      })
+    },
+  }
+}
+
+function describeSdkError(error: unknown): string {
+  if (isRecord(error) && isRecord(error.data)) {
+    const message = text(error.data.message)
+    if (message) return `the host rejected the message pull: ${message}`
+  }
+  const message = isRecord(error) ? text(error.message) : undefined
+  return `the host rejected the message pull: ${message ?? text(error) ?? "no message in the error payload"}`
+}
+
+

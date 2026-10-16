@@ -1,0 +1,397 @@
+/**
+ * GlassPane's native tool surface inside the harness (M1).
+ *
+ * Three rules shape every tool here, and they are the same rules the MCP shell
+ * already obeys:
+ *  1. judgement stays in Swift — a tool forwards the daemon's conclusion, it
+ *     never derives one (no "did it work" logic in TypeScript);
+ *  2. the model only reads `output`, so error codes and agent-executable remedies
+ *     go into that string, not only into `metadata` (measured in `harness/spike`:
+ *     a metadata-only remedy is invisible to the model);
+ *  3. a call that moves a real app goes through the harness permission plane
+ *     first, so `gp_act` cannot click silently. Upstream's tools ask under their own
+ *     namespace (`read`, `edit`, `glob`), which is why a namespace-wide `always` there is
+ *     harmless; all six `gp_*` tools share the single namespace `glasspane`, so an `always`
+ *     is a rule over the whole namespace — a read-only tool must not mint one, which would
+ *     answer `act:<role>:<action>` too. Each `always` is the call's own pattern.
+ *
+ * Parameter types come from the schemas (`Schema.Schema.Type<…>`) rather than
+ * being written by hand, exactly like the upstream tools do — a hand-written
+ * `{maxDepth?: string}` next to a `NumberFromString` schema is how a tool ends up
+ * lying about what the model will receive.
+ */
+import { Effect, Schema } from "effect"
+import * as Tool from "../tool"
+import * as Daemon from "./daemon"
+import { DIMENSION_ID_LIMITS, validateDimension, validateSelector } from "./kernel"
+
+/**
+ * The review dimension this call was made for, as the model declares it.
+ *
+ * It is a harness-side annotation, never engine input: the Swift daemon has no idea what
+ * "spec-compliance" means, so `engineBody()` strips it before anything leaves the
+ * process. What it buys is the *label* on a recorded decision — and only one engine
+ * method produces one to label. `last_evidence` is the single reply that carries an
+ * `evidencePack` (measured against the engine: one emitter, `Dispatcher.swift:156`);
+ * `act` answers with the flat operation dict (`EngineCore.swift:1275-1300`) and
+ * `attach`/`observe`/`diagnose`/`probe_status` carry no pack either. So a dimension
+ * declared on `gp_act`, `gp_observe`, `gp_attach` or `gp_diagnose` cannot move the
+ * coverage counter — those calls record no decision for the kernel to attribute it to.
+ * Cite the operation with `gp_last_evidence` and declare the dimension there.
+ *
+ * Absent is legitimate and means "this call served no declared dimension"; compaction
+ * then reports that dimension as unverified rather than inventing one, and a call whose
+ * engine reply held no pack is counted as a call without a decision record — an absent
+ * record reads as absent, never as fine. A malformed id is refused before the call,
+ * because a typo would be counted as an unplanned dimension and silently rename what the
+ * session claims it covered.
+ */
+const DimensionArg = Schema.optional(
+  Schema.String.annotate({
+    description: `the review dimension this call serves, kebab-case (e.g. "security", "spec-compliance"); omit it when the call was not made for a dimension. Only gp_last_evidence's reply carries the evidence pack a decision is recorded from, so a dimension declared on any other gp_* call labels nothing and stays reported as unverified`,
+    pattern: DIMENSION_ID_LIMITS.pattern.source,
+    maxLength: DIMENSION_ID_LIMITS.maxLength,
+  }),
+)
+
+/** Drop the harness-side annotation from what the daemon is asked to do.
+ *  Exported for the M1 fixed-point tests: "the engine never sees our annotation" is
+ *  the invariant worth pinning, and a test can only pin what it can name. */
+export function engineBody(params: Record<string, unknown>): Record<string, unknown> {
+  const { dimension: _dimension, ...rest } = params
+  return rest
+}
+
+/** One fixed metadata shape: upstream infers the tool's metadata type from what
+ *  `execute` returns, so a union of shapes there becomes a union the registry
+ *  cannot carry. Exported for the M1 fixed-point tests (same reason as
+ *  `glasspaneRow` in M5): the remedy-in-output rule is the invariant worth pinning,
+ *  and a test can only pin what it can name. */
+export function present(
+  tool: string,
+  method: string,
+  reply: Daemon.DaemonReply,
+  summary: (result: unknown) => string,
+  dimension: string | null = null,
+): Tool.ExecuteResult {
+  if (!reply.ok) return refused(tool, method, reply.error, dimension)
+  return {
+    title: `${tool}: ${method} ok`,
+    output: summary(reply.result),
+    metadata: { ok: true, method, code: null, message: null, remedy: null, dimension, result: reply.result as object },
+  }
+}
+
+/**
+ * Render a refusal. The three fields are transcribed from the daemon's own error
+ * frame, which is the only source of them: a surface that re-worded an engine
+ * failure would be answering "why did this not work" with its own guess, and the
+ * remedy the engine attached — the one it knows is executable — would be lost.
+ * Exported for the M1 fixed-point tests, for the same reason as `present`.
+ */
+export function refused(tool: string, method: string, error: Daemon.DaemonError, dimension: string | null = null): Tool.ExecuteResult {
+  return {
+    title: `${tool}: ${error.code}`,
+    output: `${error.message}\nremedy: ${error.remedy}`,
+    metadata: { ok: false, method, code: error.code, message: error.message, remedy: error.remedy, dimension, result: null },
+  }
+}
+
+/** The remedy this surface writes for itself, because the engine has not answered
+ *  yet and there is one thing the agent can still do: ask the engine what it
+ *  advertises. */
+const CAPABILITY_REMEDY = "start or update the GlassPane background service, then call gp_probe_status to see what the engine advertises"
+
+/**
+ * Refuse a method the running engine has not announced. Reading capabilities from
+ * `hello` instead of a hard-coded list is deliberate: the method table grows
+ * (`audit_ui` landed after this file was written), and a copied list would let the
+ * harness claim support it does not have.
+ *
+ * The capability asked for is the **method's own wire name**, and that is a fact about the
+ * engine, not a convention we chose: `hello.capabilities` is derived from its method table
+ * (`FrameCodec.swift`, `EngineMethod.capabilityWireNames` = every method except `hello` and
+ * `shutdown`), so "does this engine do M" and "does hello advertise M" are the same
+ * question. Taking the capability as a separate argument is how `gp_attach` ended up gated on
+ * `"observe"` — a check that answered a different question than the one being asked, refusing
+ * an engine that supports attach-without-observe and waving through the reverse. Callers who
+ * need a different capability string need a reason the engine can state; there is none today.
+ *
+ * The two refusals here are not the same claim, and only one of them is ours to
+ * word. When `hello` advertised a list and the capability is not in it, "does not
+ * advertise" is measured. When `hello` itself failed — timed out, found the
+ * daemon's single connection slot taken, came back without a list — nothing has been
+ * established about the method, and the engine already said what is wrong and what
+ * to do about it, so its code, message and remedy go to the model unchanged.
+ * Relabelling a busy engine as `GP_E_CAPABILITY_UNAVAILABLE` told the model the
+ * daemon does not speak this method, and sent the user off to restart a service that
+ * was fine.
+ */
+export const requireCapability = (tool: string, method: string) =>
+  Effect.map(Daemon.probeCapabilities(), (probe): Tool.ExecuteResult | undefined => {
+    if (!probe.ok) return refused(tool, method, probe.error)
+    if (probe.report.capabilities.includes(method)) return undefined
+    return refused(tool, method, {
+      code: "GP_E_CAPABILITY_UNAVAILABLE",
+      message: `engine ${probe.report.version} does not advertise the "${method}" capability this call needs`,
+      remedy: CAPABILITY_REMEDY,
+    })
+  })
+
+const json = (value: unknown) => JSON.stringify(value, null, 2)
+
+/**
+ * Read fields out of a daemon response without asserting its shape away. An
+ * `as { nodeCount?: unknown }` on `unknown` silences the checker and tells the
+ * reader the shape is known — it is not; the engine can add or rename fields, and
+ * a non-object answer should surface as `unknown`, not as a thrown property access.
+ */
+function fields(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {}
+  return value as Record<string, unknown>
+}
+
+/**
+ * Render one engine-reported value into the model-facing text.
+ *
+ * `String(unknown)` is what the linter flags 13 times here, and it deserves the
+ * flag: an object arriving from the daemon would stringify to `[object Object]`
+ * and the agent would read that as a fact about the app. Anything non-primitive
+ * is reported as its JSON, and `null`/`undefined` as the given fallback.
+ */
+function text(value: unknown, fallback = "unknown"): string {
+  if (value === undefined || value === null) return fallback
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value)
+  return JSON.stringify(value)
+}
+
+
+export const ProbeStatusParams = Schema.Struct({})
+
+export const ProbeStatusTool = Tool.define(
+  "gp_probe_status",
+  Effect.gen(function* () {
+    return {
+      description:
+        "Ask the GlassPane background service what it can actually see: engine version, protocol, which verification capabilities it advertises, whether an in-app probe SDK is connected, and the four macOS permission seats (accessibility, input monitoring, screen recording, developer tools) as the daemon measures them. Read-only; touches no target app.",
+      parameters: ProbeStatusParams,
+      execute: (_params: Schema.Schema.Type<typeof ProbeStatusParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          yield* ctx.ask({ permission: "glasspane", patterns: ["probe_status"], always: ["probe_status"], metadata: { reads: "daemon self-report only" } })
+          // No `dimension` here on purpose: a self-report produces no evidence frame, so it
+          // can never yield a decision for a dimension to be counted against. A parameter with
+          // no reader is how a tool surface starts lying about what it records.
+          const probe = yield* Daemon.call("probe_status", {})
+          const caps = yield* Daemon.probeCapabilities()
+          const head = caps.ok
+            ? `engine ${caps.report.version} / protocol ${caps.report.protocolVersion}\ncapabilities: ${caps.report.capabilities.join(", ")}\npermissions: ${json(caps.report.permissions)}`
+            : `engine self-report unavailable (${caps.error.code}) — the payload below is all the daemon gave`
+          return present("gp_probe_status", "probe_status", probe, (result) => `${head}\n\nprobe_status: ${json(result)}`)
+        }),
+    }
+  }),
+)
+
+export const AttachParams = Schema.Struct({
+  bundleId: Schema.optional(Schema.String.annotate({ description: "CFBundleIdentifier, e.g. com.apple.Notes" })),
+  // Same shape rule as `maxDepth` above: a process id arrives as a number from a shell
+  // or a script, and as a string from a model that read it off a table. Rejecting the
+  // first made this parameter unusable for the one case it exists for.
+  pid: Schema.optional(Schema.Union([Schema.NumberFromString, Schema.Int]).annotate({ description: "process id, when several instances run and the bundle id is ambiguous" })),
+  dimension: DimensionArg,
+})
+
+export const AttachTool = Tool.define(
+  "gp_attach",
+  Effect.gen(function* () {
+    return {
+      description:
+        "Point the GlassPane engine at a running macOS app by bundle id or pid so later observe/act calls have a target. Reports the app name and pid the engine resolved, and the accessibility permission it measured. Attaching invalidates earlier evidence on purpose: new target, new context.",
+      parameters: AttachParams,
+      execute: (params: Schema.Schema.Type<typeof AttachParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const blocked = yield* requireCapability("gp_attach", "attach")
+          if (blocked) return blocked
+          const declared = validateDimension(params.dimension)
+          if (!declared.ok) return refused("gp_attach", "attach", declared.error)
+          yield* ctx.ask({ permission: "glasspane", patterns: ["attach"], always: ["attach"], metadata: params })
+          const reply = yield* Daemon.call("attach", engineBody(params))
+          return present("gp_attach", "attach", reply, (result) => `attached: ${json(result)}`, params.dimension ?? null)
+        }),
+    }
+  }),
+)
+
+export const ObserveParams = Schema.Struct({
+  // [gp] The "1-10" in the description used to be prose only: an agent could ask
+  // for maxDepth=100000 and the request would sail through until the daemon's
+  // 4MB frame cap turned it into a payload error — one wasted round trip, and a
+  // denial-of-context lever aimed at the model's own tool call. The bound is now
+  // the schema, so the model is corrected before anything leaves the process.
+  // `Schema.NumberFromString` alone, though, rejected the natural JSON shape:
+  // measured 2026-10-14, `{maxDepth: 6}` died as `Expected string | undefined, got 6`
+  // and the same trap made `gp_attach({pid: 1234})` — the documented way to say which
+  // of several running instances to look at — unusable. Both shapes decode now; the
+  // bound applies to whichever one arrives.
+  maxDepth: Schema.optional(
+    Schema.Union([Schema.NumberFromString, Schema.Int]).check(Schema.isInt()).check(Schema.isBetween({ minimum: 1, maximum: 10 })).annotate({
+      description: "1-10 (enforced by the schema), engine default is 6. Lower it when the tree is huge.",
+    }),
+  ),
+  role: Schema.optional(Schema.String.annotate({ description: "filter to one role, e.g. AXButton" })),
+  dimension: DimensionArg,
+})
+
+export const ObserveTool = Tool.define(
+  "gp_observe",
+  Effect.gen(function* () {
+    return {
+      description:
+        "Read the accessibility tree of the attached app as the engine serialises it, with a node count and a digest. The digest is what makes a later comparison meaningful — do not eyeball the tree for a change you need to prove; perform the action and read what the engine reports.",
+      parameters: ObserveParams,
+      execute: (params: Schema.Schema.Type<typeof ObserveParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const blocked = yield* requireCapability("gp_observe", "observe")
+          if (blocked) return blocked
+          const declared = validateDimension(params.dimension)
+          if (!declared.ok) return refused("gp_observe", "observe", declared.error)
+          yield* ctx.ask({ permission: "glasspane", patterns: ["observe"], always: ["observe"], metadata: params })
+          const body: Record<string, unknown> = {}
+          if (params.maxDepth !== undefined) body.maxDepth = params.maxDepth
+          if (params.role !== undefined) body.role = params.role
+          const reply = yield* Daemon.call("observe", body)
+          return present("gp_observe", "observe", reply, (result) => {
+            const tree = fields(result)
+            return `nodes=${text(tree.nodeCount, "unknown")} digest=${text(tree.digest, "unknown")}\n${json(tree.axTree ?? result)}`
+          }, params.dimension ?? null)
+        }),
+    }
+  }),
+)
+
+export const Selector = Schema.Struct({
+  role: Schema.String.annotate({ description: "accessibility role, e.g. AXButton" }),
+  title: Schema.optional(Schema.String),
+  identifier: Schema.optional(Schema.String),
+})
+
+export const ActParams = Schema.Struct({
+  selector: Selector.annotate({ description: "the element to act on" }),
+  action: Schema.Literals(["press", "increment", "decrement", "showMenu", "confirm", "cancel", "pick"]),
+  degrade: Schema.optional(Schema.Boolean).annotate({
+    description: "allow the engine to act while an input window is busy; the resulting evidence is marked contaminated",
+  }),
+  dimension: DimensionArg,
+})
+
+export const ActTool = Tool.define(
+  "gp_act",
+  Effect.gen(function* () {
+    return {
+      description:
+        "Perform one accessibility action on the attached app and return what the engine observed changing: whether the action was confirmed, whether the tree changed, whether pixels changed, and the operation id that ties it to an evidence pack. This drives a real app, so it goes through the permission prompt. Degraded mode is accepted but recorded as contamination — the engine does not relax its verdict for it.",
+      parameters: ActParams,
+      execute: (params: Schema.Schema.Type<typeof ActParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const blocked = yield* requireCapability("gp_act", "act")
+          if (blocked) return blocked
+          // Both guards sit before the prompt. A request this surface is going to refuse anyway
+          // must not spend a human's answer, and the string below *is* the permission key —
+          // looking at it only after asking would mean authorizing a pattern we have not read.
+          const selector = validateSelector(params.selector.role)
+          if (!selector.ok) return refused("gp_act", "act", selector.error)
+          const declared = validateDimension(params.dimension)
+          if (!declared.ok) return refused("gp_act", "act", declared.error)
+          yield* ctx.ask({
+            permission: "glasspane",
+            patterns: [`act:${params.selector.role}:${params.action}`],
+            always: [],
+            metadata: fields(params),
+          })
+          const reply = yield* Daemon.call("act", engineBody(params))
+          return present("gp_act", "act", reply, (result) => {
+            const out = fields(result)
+            const opId = text(out.operationId, "none")
+            return [
+              `action confirmed=${text(out.actConfirmed, "?")} tree changed=${text(out.axChanged, "?")} pixels changed=${text(out.pixelChanged, "?")}`,
+              `operationId=${opId} evidenceId=${text(out.evidenceId, "none")} latencyMs=${text(out.latencyMs, "?")}`,
+              "",
+              json(result),
+              "",
+              `If that is not the change you expected, call gp_diagnose with operationId=${opId} before retrying — do not re-click and hope.`,
+            ].join("\n")
+          }, params.dimension ?? null)
+        }),
+    }
+  }),
+)
+
+export const DiagnoseParams = Schema.Struct({
+  operationId: Schema.optional(Schema.String.annotate({ description: "operation id from gp_act; omit to diagnose the most recent operation" })),
+  dimension: DimensionArg,
+})
+
+export const DiagnoseTool = Tool.define(
+  "gp_diagnose",
+  Effect.gen(function* () {
+    return {
+      // Not capability-gated, on purpose. `hello` costs a second connection to a daemon that
+      // serves one at a time, so gating is only worth it where the surface would otherwise
+      // *claim* something; here an engine without `diagnose` answers with its own
+      // unknown-method `{code, message, remedy}` frame, which is a better answer than this
+      // file could write about a method it has never seen.
+      description:
+        "Ask the engine why an operation did not produce the expected change. Returns a classification plus a four-part report (path taken, anomaly, evidence, next action). Defaults to the most recent operation when no id is given.",
+      parameters: DiagnoseParams,
+      execute: (params: Schema.Schema.Type<typeof DiagnoseParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const declared = validateDimension(params.dimension)
+          if (!declared.ok) return refused("gp_diagnose", "diagnose", declared.error)
+          yield* ctx.ask({ permission: "glasspane", patterns: ["diagnose"], always: ["diagnose"], metadata: params })
+          const reply = yield* Daemon.call("diagnose", engineBody(params))
+          return present("gp_diagnose", "diagnose", reply, (result) => {
+            const out = fields(result)
+            const report = fields(out.report)
+            return `class=${text(out.class, "unknown")}\npath: ${text(report.path, "-")}\nanomaly: ${text(report.anomaly, "-")}\nevidence: ${text(report.evidence, "-")}\nnext: ${text(report.next, "-")}`
+          }, params.dimension ?? null)
+        }),
+    }
+  }),
+)
+
+export const LastEvidenceParams = Schema.Struct({
+  operationId: Schema.optional(Schema.String.annotate({ description: "omit for the most recent operation" })),
+  dimension: DimensionArg,
+})
+
+export const LastEvidenceTool = Tool.define(
+  "gp_last_evidence",
+  Effect.gen(function* () {
+    return {
+      description:
+        "Fetch the evidence pack the engine built for an operation: before/after tree digests, pixel diff, attribution level and contamination flag, circuit-breaker state and the assertions checked. This is the artifact you cite when claiming a UI change happened.",
+      parameters: LastEvidenceParams,
+      execute: (params: Schema.Schema.Type<typeof LastEvidenceParams>, ctx: Tool.Context) =>
+        Effect.gen(function* () {
+          const declared = validateDimension(params.dimension)
+          if (!declared.ok) return refused("gp_last_evidence", "last_evidence", declared.error)
+          yield* ctx.ask({ permission: "glasspane", patterns: ["last_evidence"], always: ["last_evidence"], metadata: params })
+          const reply = yield* Daemon.call("last_evidence", engineBody(params))
+          return present("gp_last_evidence", "last_evidence", reply, (result) => json(result), params.dimension ?? null)
+        }),
+    }
+  }),
+)
+
+/**
+ * What `registry.ts` asks for: one effect yielding the ready-to-register defs, so
+ * the vendored patch stays three lines. `Tool.init` is itself an effect (it needs
+ * the truncate/agent services), and the requirement is left in the inferred `R`
+ * on purpose — annotating it `never` here would be a lie about what the registry
+ * has to provide.
+ */
+export const glasspaneDefs = Effect.gen(function* () {
+  const inits = yield* Effect.all([ProbeStatusTool, AttachTool, ObserveTool, ActTool, DiagnoseTool, LastEvidenceTool])
+  return yield* Effect.all(inits.map((info) => Tool.init(info)))
+})
