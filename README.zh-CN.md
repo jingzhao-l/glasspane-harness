@@ -1,0 +1,277 @@
+<h1 align="center">
+  <code>glasspane-harness</code>
+</h1>
+
+<p align="center">
+  <a href="README.zh-CN.md"><strong>简体中文</strong></a> ·
+  <a href="README.md"><strong>English</strong></a>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/glasspane-harness"><img src="https://img.shields.io/npm/dt/glasspane-harness?label=Downloads&style=for-the-badge&color=2ea44f&logo=npm&logoColor=white" alt="npm downloads"></a>
+  <img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.npmjs.org%2Fglasspane-harness%2Flatest&query=version&label=version&color=brightgreen" alt="version">
+  <a href="https://github.com/jingzhao-l/glasspane-harness/actions/workflows/ci.yml"><img src="https://github.com/jingzhao-l/glasspane-harness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License"></a>
+  <img src="https://img.shields.io/badge/macOS-13%2B-blue?logo=apple&logoColor=white" alt="macOS 13+">
+  <a href="https://github.com/jingzhao-l/glasspane-harness"><img src="https://img.shields.io/github/stars/jingzhao-l/glasspane-harness?style=social&label=Star" alt="Stars"></a>
+</p>
+
+<p align="center">
+  <img src="assets/banner.svg" alt="GlassPane Harness — 证据诚实的 macOS 应用 GUI 验证 harness" width="720">
+</p>
+
+---
+
+## 目录
+
+- [这项目是什么](#这项目是什么)
+- [一对产品的另一半：GlassPane](#一对产品的另一半glasspane)
+- [这是一个完整的编程 harness，不是被削过头的 fork](#这是一个完整的编程-harness不是被削过头的-fork)
+- [产品面](#产品面)
+- [安装](#安装)
+- [上手](#上手)
+- [`gp_*` 工具面](#gp-工具面)
+- [证据纪律](#证据纪律)
+- [与 iterate-harness 的双向集成](#与-iterate-harness-的双向集成)
+- [文档](#文档)
+- [开发](#开发)
+- [许可与署名](#许可与署名)
+
+---
+
+## 这项目是什么
+
+**问题。** 一个驱动真实 macOS 应用的 AI agent，没法诚实地说清界面到底有没有按它要求的动。
+它只看得见自己的工具输出，于是靠散文猜测、报成功。截图也不解决问题：截图给的是**某个瞬间**，
+不是**某次变化**，更说不清这次变化是不是那次点击造成的。
+
+**GlassPane Harness** 是一个编码 agent（[opencode](https://github.com/anomalyco/opencode)
+的 fork），通过原生 `gp_*` 工具面接到 Swift 验证引擎上。每次动作都被测量——辅助功能树 diff、
+像素 diff、崩溃与响应性信号——然后由引擎给出**它自己的**归因（`strong` / `soft` / `none`、
+熔断级、pass / fail / inconclusive）。harness 只转录，不自己下结论。成包的验证调用进哈希链
+决策日志；压缩钩子会把会话的证据锚点重新注入压缩提示词，摘要再长也丢不掉审计链。
+
+### 一对产品的另一半：GlassPane
+
+本仓库是一对产品里的一半。另一半是 [**GlassPane**](https://github.com/jingzhao-l/GlassPane)，
+macOS 上的运行时验证引擎：一个 Swift 后台服务，测量应用的无障碍树、像素变化、崩溃与响应性，
+并通过 `glasspane-mcp` 经 MCP 把这套测量交出去。
+
+这个分工是刻意且不对称的：
+
+- **应用做了什么由 GlassPane 判定。** 它持有辅助功能、输入监控与屏幕录制授权，做测量，
+  给出自己的归因。这个 harness 是那份判定的客户端，不是第二种意见。
+- **harness 只负责转写。** 它原生带着同一套 `gp_*` 面，把已验证的调用追加进哈希链决策账本，
+  并在长会话被压缩时重新注入证据锚点。它绝不自行发明判定。
+- **两边都不读对方的私有 API。** 它们吃的是同一份公开发布的契约层（`iterate-kernel`），
+  所以跨越边界的格式只有一份定义，而不是两份各自演化的文件。
+
+先把引擎装上——harness 是客户端，不是替代品：
+
+```bash
+# 引擎（macOS 14+）。权限面板弹出时，为 `GlassPane Daemon` 勾选辅助功能、
+# 输入监控与屏幕录制。
+GP="$(mktemp "${TMPDIR:-/tmp/}gp-install.XXXXXXXX")" && curl -fsSL https://raw.githubusercontent.com/jingzhao-l/GlassPane/main/install.sh -o "$GP" && sh "$GP" && rm -f "$GP"
+```
+
+安装渠道、权限、证据包格式与更新线都在它的 README：[jingzhao-l/GlassPane](https://github.com/jingzhao-l/GlassPane)。
+引擎也服务不是这个 harness 的 MCP host（Claude Desktop、Cursor、任意 MCP 客户端），
+`glasspane-mcp` 就是为此存在的。
+
+## 这是一个完整的编程 harness，不是被削过头的 fork
+
+验证接线是这次分叉的落点，但它是**加法**：上游 opencode 会做的每一件事，这个 harness 都会做——
+同样的 agent、工具、模型、权限，同样的 LSP 与 MCP 支持，同样的 TUI 与 web 应用，同样的
+SDK 与 plugin API。为了塞下内核，没有任何功能被砍掉。
+
+这句话是**量出来的**，不是承诺。分叉锚定上游
+[anomalyco/opencode](https://github.com/anomalyco/opencode) 的某个 tag，
+`harness/tools/fork-diff.mjs` 每次改动都会把本树与那个 tag 逐文件对比。那把尺子自己打出的就是
+下面这一行——原样照抄，对着 2026-10-18 记录的金样：
+
+```
+fork-diff vs v1.18.32: 4645/6724 byte-identical, 282 edited, 92 added, 1705 deleted
+```
+
+上游发来的 6,632 个文件里 4,645 个仍逐字节保持上游原样。改动（282 个）集中在 config/paths/品牌、
+`gp_*` 工具面、内核绑定、压缩钩子和打包脚本；删掉的是上游**自己的**发布管道（ghcr 镜像、AUR、
+Homebrew tap、托管 console 账号）——外加 0.4.0 里下面说的第一方账号面。
+
+"加法"在实践中的含义：上游后续版本发布的功能，这个 fork 接得住——因为功能还在那里。
+
+### 唯一的例外，而且是刻意的：没有账号，自带 API key
+
+上游可以 `auth login` 登录 opencode 账号，用来解锁 opencode 自家的模型网关（目录里的第一方
+provider）和云端会话分享。本产品没有这个账号，所以这片面是**删掉**而不是留一个跑不通的壳：
+
+- 上游目录里的 `opencode` provider 条目被过滤掉
+- `auth login` / `logout` / `switch`、`/org` 命令、组织切换器全部移除
+- `/experimental/console*` 端点与 console 托管 provider 状态全部移除
+- 分享会话到上游 opencode 云端的能力移除（`share` / `autoshare` 配置键一并移除）
+
+**目录里其他一切都原封不动。** Anthropic、OpenAI、Google、GitHub Copilot、Amazon Bedrock、
+Azure、OpenRouter 等等全在——几百个模型——每一个都用**你自己的 API key** 解锁：环境变量、
+配置文件里的 `{env:NAME}` 模板，或 TUI 的 `/connect` 对话框。不用注册、不用登录。见
+[`docs/models-and-keys.md`](docs/models-and-keys.md)。
+
+## 产品面
+
+| 产品面 | 你拿到什么 | 怎么发 |
+|---|---|---|
+| **CLI + TUI** | 终端里的 agent：交互式 TUI、`run` 一次性任务、`serve` 无头服务 | `glasspane-harness` / `gp-harness` 二进制，npm + 一键安装器 |
+| **Web 应用**（内嵌） | 二进制自己服务的浏览器界面——没有第二个进程、不单独部署 | 嵌进二进制（`--skip-embed-web-ui` 出纯 CLI 构建） |
+| **文档** | 本仓 `docs/`——安装、工具面、证据、迁移、排障 | 仓内 markdown（canonical，与代码同版本） |
+| **SDK** | TypeScript SDK 与 plugin SDK，用来写自己的 `gp_*` 式工具 | 工作区包，随树发布 |
+
+**刻意不发**：上游的托管 console / enterprise 栈（私有 harness 不需要"组织与额度后台"这种形态）、
+上游的**文档站**（`packages/web`）——这些片已**从本仓删除**；本产品的 canonical 文档是 `docs/`。
+它们从来不属于这个产品，把别人的产品面留在自己仓里只会让私有化变成自欺。**Electron 桌面 app
+不随产品发布，这是决定**：`packages/desktop` 仍在树里，但它是**血缘**——`product.json` 的
+`product.lineageOnly` 把它记作 `packages/desktop (Electron — second batch: needs signing/notarisation accounts)`，
+第二批缺的正是签名与公证账号。
+
+## 安装
+
+```bash
+npm install -g glasspane-harness     # 推荐
+bun add -g glasspane-harness
+curl -fsSL https://raw.githubusercontent.com/jingzhao-l/glasspane-harness/v0.13.0/scripts/install.sh | bash
+```
+
+会装出两个命令：**`glasspane-harness`** 与短别名 **`gp-harness`**。npm 与 bun 从 wrapper 的
+`bin` 映射拿到这个别名；发布资产里只有一个二进制，所以一键通道由 `scripts/install.sh` 在它旁边
+创建这个别名，并且那个名字不可执行时就拒绝这次安装。
+
+有的包管理器默认不跑安装脚本，而把真二进制放到位的正是 wrapper 的 `postinstall`。
+0.7.0 实测：npm 这条路是好的（npm 11+ 首次安装会打一条 `allow-scripts` 提示，命令照样能跑）；
+`bun add -g` 会跳过那一步，命令于是打印它自己的补救——0.7.7 起那一句点名的是**这一份安装自己
+的目录**，所以照抄执行就是修法。
+详见 [docs/install.md](docs/install.md)。
+
+**只支持 macOS。** 引擎、权限模型、证据流水线都只存在于 macOS，npm 分发随之收成
+macOS-only：包声明 `os: darwin`，非 macOS 上 npm 直接拒绝安装，而不是给你一个跑不了的
+二进制。**没有 Linux / Windows 构建，这是决定，不是遗漏。**
+
+前提：macOS 13+（Apple silicon 或 Intel）；要用 `gp_*` 工具面还需要 **GlassPane** 后台服务在跑且已授予辅助功能权限
+（[先装 GlassPane](https://github.com/jingzhao-l/GlassPane)，安装器会把下一步说清楚）。没有引擎时，
+每个 `gp_*` 调用只会回 `GP_E_ENGINE_UNREACHABLE` 加一条 remedy——那是引擎的话，不是安装器的。
+
+若 npm 的全局前缀不可写，用 `npm install -g --prefix "$HOME/.local" glasspane-harness` 并把
+`~/.local/bin` 放进 PATH；安装器会自己检测到这种失败并把这条补救打出来。
+
+## 上手
+
+```bash
+glasspane-harness                                  # 交互式 TUI（内嵌 web 应用也会被服务出来）
+glasspane-harness run "attach 到备忘录，打一个标题，然后告诉我 UI 有没有给出证据"
+glasspane-harness serve --port 4096                # 无头服务；web 应用由它提供
+glasspane-harness --help
+```
+
+任何会话里第一件该问的事是 `gp_probe_status`：它报引擎版本、宣称的能力与权限状态——
+工具面里每条 remedy 都指回它。
+
+## `gp_*` 工具面
+
+| 工具 | 作用 | 权限 |
+|---|---|---|
+| `gp_probe_status` | 引擎自报：版本、能力、辅助功能/输入监听/屏幕录制/开发者工具状态 | 询问（诊断入口） |
+| `gp_attach` | 按 bundle id 或 pid 附着到运行中的应用 | 询问 |
+| `gp_observe` | 快照附着窗口的辅助功能树（digest、节点数） | 询问 |
+| `gp_act` | 执行一次辅助功能动作，返回引擎观察到的东西（op id 关联证据包） | 询问（会动真实应用） |
+| `gp_diagnose` | 按证据包给操作定性（污染 / 带外 / 回调 / 既有问题 / 无变化） | 询问 |
+| `gp_last_evidence` | 取回引擎为某次操作归档的证据包 | 询问 |
+
+方法是否存在**从运行中的引擎读**（`hello.capabilities`），本文件不写死清单——那份清单在本文件
+之后还会长。完整参考：[`docs/tools.md`](docs/tools.md)。
+
+## 证据纪律
+
+1. **判定留在 Swift**：归因、诊断类、熔断级、pass / fail / inconclusive 都由 GlassPane 引擎算；
+   harness 只转录、不推导。工具面长出阈值、像素裁决或 pass/fail 合成，CI 棘轮即红。
+2. **模型看到的必须是引擎说过的**：错误码与可执行 remedy 进工具的 `output` 文本，不只塞 metadata。
+3. **审计链是产品功能**：成包调用进哈希链决策日志（op id ↔ entry hash）；固定点用两个独立哈希
+   实现复算链条，账本不必信任写它的那段代码也能验。
+4. **压缩不许抹掉证据**：压缩钩子把证据锚点注入摘要提示词；缺席以算术呈现
+   （`gp_* calls: N · decisions recorded: M`），不许靠默认。
+
+细节：[`docs/evidence.md`](docs/evidence.md)。
+
+## 与 iterate-harness 的双向集成
+
+GlassPane Harness 是第二对产品里的一半。引擎回答"这次操作到底生效了吗"；
+[iterate-harness](https://github.com/jingzhao-l/iterate-harness) 回答"这段代码对不对"。
+两边不靠聊天记录对接——跨越边界的东西都由一侧写成可核验的记录，另一侧读它。
+
+- **同一种链格式，先验通再引用。** 每条从证据包记下的决定都追加进哈希链账本
+  （`~/.local/share/glasspane-harness/decisions.jsonl`，或由 `GLASSPANE_DECISION_LOG` 指到别处）。
+  审查回路把 `.iterate/decision-log.jsonl` 写进被审项目，用的是同一种链格式，所以从对方那本引来的
+  主张会先整链验通：被改过的行会被拒绝，并说清链断在第几行。今天在生产里跑这个读者的是回路这一侧
+  （`fix_proof`）；本 fork 带的是同一个校验器，一条固定点测试钉住"那边写的链在这边验得过"。
+  一个项目可以一次性用 `ih iterate glasspane-ledger <绝对路径>` 把回路的账本记为自己的修复证据来源：
+  链接只在整链验通之后落笔，并钉住链的首条，被替换的账本因此不再够格。
+- **审查维度跟着调用走。** 有 5 项 `gp_*` 工具接受可选的 `dimension` 参数——`gp_act`、`gp_observe`、
+  `gp_diagnose`、`gp_last_evidence`、`gp_attach`——两侧是同五项。引擎从不看见这个词：声明在请求
+  出网前就被剥掉，回显由本 harness 自己写。与同一 operationId 上已有见证矛盾的决定会被拒绝
+  （`KERNEL_E_DIMENSION_CONTEST`）。
+- **复核不过，就回到应用本身。** 一轮的 invariant 复核失败时，回路通过宿主的 MCP 通道再次只读地问
+  那个正在跑的应用：每个已记录操作构造一条 `gp_last_evidence` 加一条 `gp_diagnose`；允许名单是
+  5 项只读工具，会改动应用的调用被点名拒绝。
+- **压缩知道这次查了什么。** 压缩钩子会重新注入会话的证据锚点（operationId、结果、台账行号、
+  条目哈希）。运行计划（`.iterate/run-plan.json` 或 `GLASSPANE_RUN_PLAN`）决定先丢哪一维的历史；
+  声明了维度却进不了锚点的调用会被数出来，而不是假设它们还在。
+- **修复不靠代理自称就算完成。** 推进修复配方之前，闸会读三件实测的东西：本轮 invariant 判定、
+  项目配方（`GLASSPANE_RECIPE`），以及一条链可验、按 operationId 记着通过结果的账本行。
+  缺任何一件或未量到都具名拒绝（`RECIPE_GATE_E_*`）。答案落进项目账本；契约拒绝一个字节都不写。
+  两扇门都读得回来：终端里 `ih iterate gate`，会话里 `/iterate gate`。
+- **两个工具面说的是同一份 provider 契约。** 本 fork 与 MCP 层注册同一个 provider id 和每个方法
+  相同的先决条件；跑两侧注册代码的尺子一旦发现分叉就红。
+
+各归各位：应用做了什么由引擎判定，两个 harness 都不自行给界面下结论。闸只报与拦，不执行配方——
+两个产品都没有配方执行器。上面这些格式来自同一份发布出去的契约层
+[`iterate-kernel`](https://www.npmjs.com/package/iterate-kernel)，边界也说清楚：
+"两份实现对语料没写过的案子还一致吗"由 `scripts/diff_kernel_implementations.py` 回答——它是给操作者
+跑的命令，不在 CI 步骤里。回路那一侧的说明见 iterate-harness README 的
+[与 GlassPane 的双向集成](https://github.com/jingzhao-l/iterate-harness/blob/main/README.zh-CN.md#-与-glasspane-的双向集成)，
+引擎那一侧见 [GlassPane 的双向集成小节](https://github.com/jingzhao-l/GlassPane#two-way-integration-with-the-review-loop)。
+实现细节：[`docs/kernel-integration.md`](docs/kernel-integration.md) 与
+[`docs/evidence.md`](docs/evidence.md)。
+
+## 文档
+
+- [`docs/install.md`](docs/install.md) — 安装通道、权限、自检
+- [`docs/models-and-keys.md`](docs/models-and-keys.md) — 模型目录，以及怎么把你自己的 API key
+  交进去
+- [`docs/tools.md`](docs/tools.md) — 逐个参数的 `gp_*` 参考
+- [`docs/evidence.md`](docs/evidence.md) — 归因、诊断、决策日志
+- [`docs/migrate-from-opencode.md`](docs/migrate-from-opencode.md) — 相对上游改了什么、刻意留了什么
+- [`docs/release.md`](docs/release.md) — 怎么切一版，以及 npm trusted-publisher 的配置
+- [`docs/kernel-integration.md`](docs/kernel-integration.md) — 共享内核、它如何以钉住的
+  `iterate-kernel` 依赖进入本 fork、以及双向集成今天到底有多少
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — 引擎不可达、权限拒绝、`GP_E_*` 码表
+- [`FORK.md`](FORK.md) / [`SYNCLOG.md`](SYNCLOG.md) — 分叉坐标、纪律、每批实测数字；
+  [`NOTICE`](NOTICE) — 署名；[`CHANGELOG.md`](CHANGELOG.md) — 每个版本发了什么
+
+## 开发
+
+```bash
+bun install                # 工作区（被 TLS 拦截的网络上 bun 需要 NODE_EXTRA_CA_CERTS，见 FORK.md）
+bun run typecheck
+bun test --timeout 30000    # 固定点测试（在 packages/opencode 里跑）
+cd packages/opencode && bun run build --single   # 产品构建：CLI + TUI + 内嵌 web 应用
+```
+
+`build` 是 `packages/opencode/package.json` 里的脚本，工作区根**没有** `build` 这个脚本，所以最后
+那条必须在那个包里跑——在根上跑会死在 `Script not found "build"`，那正是
+[docs/release.md](docs/release.md) 记的四次栽跟头里的第一次。
+
+仓侧的闸住在 GlassPane 仓的 `harness/`（hook-liveness、fork-diff、kernel-pin、
+tool-surface、surface-semantics、product-surface、brand-surface），理由、反向控制与已知边界
+写在 `harness/README.md`。我们每个定制提交都带 `[gp]` 前缀。
+
+## 许可与署名
+
+MIT，与上游一致。`LICENSE` 是上游原文未改，[`NOTICE`](NOTICE) 记录本 fork 改了什么、代码来自哪里。
+上游：[anomalyco/opencode](https://github.com/anomalyco/opencode) `v1.18.32` © SST——没有他们就没有
+这个产品，而 `FORK.md` 的存在是为了让这句话在未来的每次同步后仍然成立。
+
