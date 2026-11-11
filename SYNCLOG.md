@@ -41,6 +41,8 @@
 
 - **TUI 快照 / 真模型轮次**：本轮零产品行为改动（只动测试桩、版本号、金样），没有触发条件，
   **未观测**。
+- **npm 三包发布与 GitHub Release**：由 `release.yml` 的 workflow_dispatch（`--ref v0.14.12`）
+  承载；本条只落地 trunk 侧子树与 split/tag，发布在切完签名 tag 后触发。
 
 ### 四、发布链实测（本条收口补记）
 
